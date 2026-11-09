@@ -1,0 +1,26 @@
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment and passwords
+.env
+.env.*
+!.env.example
+
+# Local databases and billing records
+*.db
+*.sqlite
+*.sqlite3
+food_bills.json
+ink.txt
+
+# PMS generated files
+pms_exports/
+
+# Editor and temporary files
+.vscode/
+*.log
+*.tmp
