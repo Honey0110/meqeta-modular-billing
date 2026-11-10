@@ -1,22 +1,17 @@
-
-# PMS automation for the MEQETA billing application.
-# This file keeps the original logic intact; only explanatory comments were added.
-# Dependencies, constants, and helper functions are imported from shared.py.
-# External automation uses the currently focused window: verify focus before running.
-
 from shared import *
+import pyautogui
+
+# Time to switch focus from the billing app to another application.
+FOCUS_SWITCH_DELAY_MS = 5000
+TYPE_INTERVAL_SECONDS = 0.12
+
 
 class AutomationMixin:
-    # ==================================================================
-    # MAIN ENTRY POINT: LOAD BILL BY KOT
-    # Ask for a KOT, locate its unique bill, load bill/items, validate PMS fields and schedule automation.
-    # ==================================================================
     def fill_to_pms(self):
         """Fetch bill by KOT, load bill header AND its items, then fill PMS."""
         if self.automation_running:
             return
 
-        # Ask for the KOT number; cancelling leaves the current bill untouched.
         kot = simpledialog.askstring(
             "Fill to PMS", "Enter KOT Number:",
             initialvalue=self.v["kot"].get().strip(), parent=self.root
@@ -31,7 +26,6 @@ class AutomationMixin:
         connection = None
         cursor = None
         try:
-            # Open a database connection and look up bills matching this KOT.
             connection = get_db_connection()
             cursor = connection.cursor(dictionary=True)
             cursor.execute(
@@ -42,7 +36,6 @@ class AutomationMixin:
             if not matches:
                 messagebox.showwarning("KOT Not Found", f"No bill found for KOT {kot}.")
                 return
-            # A KOT matching multiple bills is ambiguous: do not choose silently.
             if len(matches) != 1:
                 messagebox.showwarning(
                     "Ambiguous KOT",
@@ -61,7 +54,6 @@ class AutomationMixin:
                 connection.close()
 
         try:
-            # Retrieve the full bill, including its item rows.
             data = self.get_bill_from_database(bill_no)
             if data is None:
                 messagebox.showwarning("Not Found", f"Bill {bill_no} not found.")
@@ -69,25 +61,18 @@ class AutomationMixin:
             automation_data = {
                 key: str(data.get(key) or "").strip() for key in PMS_FIELDS
             }
-            # All required PMS fields must be present before automation starts.
             missing = [key for key, value in automation_data.items() if not value]
             if missing:
                 messagebox.showwarning("Missing PMS Data", ", ".join(missing))
                 return
             automation_data["date"] = normalize_date(automation_data["date"])
 
-           # Load the bill header and item rows from the database.
+            # load_data() clears old rows and populates Code/Item/Qty/Rate.
+            # calculate() derives Amount and all totals from those values.
             self.load_data(data)
-
-# Keep the data available for PMS automation.
             self.pending_bill_data = data
             self.automation_data = automation_data
-
-# Update totals.
             self.calculate()
-
-          # Bill fields and item rows will be filled
-          # progressively by the automation functions.
             self.status.set(
                 f"Loaded bill {bill_no}, KOT {kot}, "
                 f"{len(data.get('items', []))} item(s) from MariaDB."
@@ -96,17 +81,97 @@ class AutomationMixin:
             messagebox.showerror("Database Error", str(error))
             return
 
-        # Mark automation active and delay target detection to allow focus changes.
         self.automation_running = True
         self.external_cancel.clear()
-        # Increment the token so callbacks from older runs cannot continue.
         self.automation_token += 1
         token = self.automation_token
-        self.finish_automation("Internal automation completed."
-            )
-        return
+        self.set_controls(False)
+        self.automation_job = self.root.after(
+            FOCUS_SWITCH_DELAY_MS, lambda: self.detect_target(token)
+        )
 
-        # Follow the configured PMS_FIELDS order rather than widget layout order.
+
+    def detect_target(self, token):
+        if token != self.automation_token:
+            return
+
+        if not self.automation_running:
+            return
+
+        self.automation_job = None
+
+        active_handle = active_window_handle()
+
+        try:
+            own_handle = self.root.winfo_id()
+
+            own_root = root_window_handle(
+                own_handle
+            )
+
+            active_root = root_window_handle(
+                active_handle
+            )
+
+            is_internal = (
+                active_root == own_root
+                and active_root is not None
+            )
+
+        except tk.TclError:
+            is_internal = False
+
+        if is_internal or sys.platform != "win32":
+            self.start_internal_automation(token)
+        else:
+            self.start_external_automation(token)
+
+
+    def start_internal_automation(self, token):
+        self.automation_index = 0
+
+        for key in DROPDOWN_FIELDS:
+            widget = self.fields[key]
+            options = list(widget["values"])
+            value = self.automation_data[key]
+
+            match = next(
+                (
+                    option for option in options
+                    if str(option).casefold()
+                    == str(value).casefold()
+                ),
+                None
+            )
+
+            if match is None:
+                options.append(value)
+                widget["values"] = options
+            else:
+                self.automation_data[key] = match
+
+        self.status.set(
+            "Internal automation started..."
+        )
+
+        self.fill_internal_field(token)
+
+
+    def fill_internal_field(self, token):
+        if token != self.automation_token:
+            return
+
+        if not self.automation_running:
+            return
+
+        self.automation_job = None
+
+        if self.automation_index >= len(PMS_FIELDS):
+            self.finish_automation(
+                "Internal automation completed."
+            )
+            return
+
         key = PMS_FIELDS[self.automation_index]
         value = self.automation_data[key]
 
@@ -119,73 +184,30 @@ class AutomationMixin:
             )
             return
 
-        # Type the field value character by character.
-            self.type_internal_text(
-                key,
-                value,
-                token,
-            self.next_internal_field)
-        return
-
-        try:
-            widget.icursor("end")
-        except tk.TclError:
-            pass
-
-        self.status.set(
-            f"Filled {key.upper()}: {value}"
-        )
-
-        self.next_internal_field(token)
+        # Show each character instead of instantly assigning the value.
+        self.type_internal_text(key, value, token)
 
 
-    # ==================================================================
-    # VISIBLE DROPDOWN SELECTION
-    # Open the dropdown briefly, select the matching option, then proceed to the next field.
-    # ==================================================================
-    
-    def type_internal_text(self, key, value, token, on_complete):
-        """
-        Visibly type Bill No and KOT No.
-        Each character appears after 120 milliseconds.
-        """
-
-        # Get the correct input field.
-        widget = self.fields[key]
-        widget.focus_set()
-
-        # Clear the existing field.
+    def type_internal_text(self, key, value, token):
+        """Animate a header field without blocking the Tkinter event loop."""
         self.v[key].set("")
         value = str(value)
 
-        def type_character(index=0):
-            """Type one character at a time."""
-
-            # Stop if the automation was cancelled.
-            if token != self.automation_token:
+        def write_next(index=0):
+            if token != self.automation_token or not self.automation_running:
                 return
-
-            if not self.automation_running:
-                return
-
-            # Move to the next field when typing finishes.
             if index >= len(value):
-                on_complete(token)
+                self.status.set(f"Typed {key.upper()}: {value}")
+                self.next_internal_field(token)
                 return
-
-            # Display the next character.
             self.v[key].set(value[:index + 1])
-
-            # Wait 120 ms before typing again.
             self.automation_job = self.root.after(
-                120,
-                lambda: type_character(index + 1)
+                120, lambda: write_next(index + 1)
             )
 
-        # Start the typing animation.
-        type_character()
+        write_next()
 
-    
+
     def select_internal_dropdown(
         self, key, value, token
     ):
@@ -207,7 +229,6 @@ class AutomationMixin:
             index = len(options) - 1
 
         try:
-            # Attempt to show the dropdown before selecting its value.
             widget.event_generate("<Alt-Down>")
         except tk.TclError:
             pass
@@ -239,106 +260,114 @@ class AutomationMixin:
             choose_option
         )
 
+
+    def next_internal_field(self, token):
+        self.automation_index += 1
+
+        if self.automation_index >= len(PMS_FIELDS):
+            self.fields["kot"].focus_set()
+
+            self.finish_automation(
+                "Internal automation completed."
+            )
+            return
+
+        self.automation_job = self.root.after(
+            INTERNAL_FIELD_DELAY_MS,
+            lambda: self.fill_internal_field(token)
+        )
+
+
+    def start_external_automation(self, token):
+        self.status.set(
+            "External PMS automation started..."
+        )
+
+        data = dict(self.automation_data)
+        # Take a snapshot of item data before the worker thread starts.
+        data["_items"] = list(self.pending_bill_data.get("items", []))
+
+        self.external_thread = threading.Thread(
+            target=self.external_worker,
+            args=(data, token),
+            daemon=True
+        )
+
         self.external_thread.start()
 
 
-    # ==================================================================
-    # EXTERNAL FIELD SEQUENCE
-    # Send bill, date, waiter, service and KOT, advancing with the configured key.
-    # ==================================================================
     def external_worker(self, data, token):
+        """Type into the external window that had focus after the switch delay.
+
+        Enter navigation depends on the target application's keyboard behavior.
+        The worker never manipulates Tkinter widgets directly.
         """
-        External PMS sequence:
-
-        Bill -> Enter -> Date -> Enter ->
-        Waiter -> Enter -> Service -> Enter -> KOT
-
-        IMPORTANT:
-        The external PMS Bill No field must have
-        keyboard focus when automation starts.
-        """
-
         try:
-            # External target must start with keyboard focus on its Bill field.
-            sequence = [
-                ("bill", data["bill"]),
-                ("date", data["date"]),
-                ("waiter", data["waiter"]),
-                ("service", data["service"]),
-                ("kot", data["kot"])
-            ]
-
-            for index, (key, value) in enumerate(sequence):
+            sequence = [(key, data[key]) for key in PMS_FIELDS]
+            items = data.get("_items", [])
+            # Header fields: Bill, Date, Waiter, Service, KOT.
+            for key, value in sequence:
                 if self.external_cancel.is_set():
                     return
-
                 if key in DROPDOWN_FIELDS:
-                    self.fill_external_dropdown(value)
+                    if not self.fill_external_dropdown(value):
+                        return
                 else:
                     self.fill_external_text(value)
+                if self.external_cancel.wait(EXTERNAL_FIELD_DELAY):
+                    return
+                pyautogui.press(EXTERNAL_NEXT_KEY)
 
-                if index < len(sequence) - 1:
-                    if self.external_cancel.wait(
-                        EXTERNAL_FIELD_DELAY
-                    ):
+            # Item rows: Code, Item, Qty, Rate, Amount.
+            # Assumes each Enter moves to the next cell, including the next row.
+            for item in items:
+                if self.external_cancel.is_set():
+                    return
+                if not isinstance(item, dict):
+                    raise ValueError("Item row is not a dictionary; check database item format")
+                code = item.get("code", "")
+                name = item.get("item", item.get("name", ""))
+                qty = item.get("qty", item.get("quantity", ""))
+                rate = item.get("rate", "")
+                amount = item.get("amount")
+                if amount is None or amount == "":
+                    try:
+                        amount = f"{float(qty) * float(rate):.2f}"
+                    except (TypeError, ValueError):
+                        amount = ""
+                for value in (code, name, qty, rate, amount):
+                    if self.external_cancel.is_set():
                         return
-
+                    self.fill_external_text(value)
+                    if self.external_cancel.wait(EXTERNAL_FIELD_DELAY):
+                        return
                     pyautogui.press(EXTERNAL_NEXT_KEY)
 
             if not self.external_cancel.is_set():
-                self.external_results.put(
-                    (
-                        token,
-                        True,
-                        "External PMS automation completed."
-                    )
-                )
-
+                self.external_results.put((token, True, "External PMS automation completed."))
         except Exception as error:
             if not self.external_cancel.is_set():
-                self.external_results.put(
-                    (token, False, str(error))
-                )
+                self.external_results.put((token, False, str(error)))
 
-
-    # ==================================================================
-    # EXTERNAL TEXT INPUT
-    # Replace the currently focused field using clipboard paste (Ctrl+A then Ctrl+V).
-    # ==================================================================
     def fill_external_text(self, value):
-        # Current implementation pastes text; it does not simulate character typing.
-        pyperclip.copy(str(value))
-        pyautogui.hotkey("ctrl", "a")
-        pyautogui.hotkey("ctrl", "v")
+        """Type rather than paste into the currently focused external field."""
+        pyautogui.write(str(value), interval=TYPE_INTERVAL_SECONDS)
 
-
-    # ==================================================================
-    # EXTERNAL DROPDOWN INPUT
-    # Open the active dropdown, wait briefly, and type its value.
-    # ==================================================================
     def fill_external_dropdown(self, value):
-        # Request the target application to open its dropdown.
+        """Open a dropdown and type its value (target-specific behavior)."""
         pyautogui.hotkey("alt", "down")
+        if self.external_cancel.wait(EXTERNAL_DROPDOWN_DELAY):
+            return False
+        pyautogui.write(str(value), interval=TYPE_INTERVAL_SECONDS)
+        # Do not press Enter here: external_worker handles navigation.
+        return True
 
-        if self.external_cancel.wait(
-            EXTERNAL_DROPDOWN_DELAY
-        ):
-            return
 
-        pyautogui.write(
-            str(value),
-            interval=0.04
-        )
-# ==================================================================
-    # THREAD RESULT POLLING
-    # Read background-worker results safely on the Tkinter UI thread.
-    # ==================================================================
     def poll_external_results(self):
         if self.closing:
             return
 
         try:
-            # Drain all available completion/error messages without blocking.
             while True:
                 token, success, message = (
                     self.external_results.get_nowait()
@@ -358,10 +387,6 @@ class AutomationMixin:
         )
 
 
-    # ==================================================================
-    # ENABLE OR DISABLE UI CONTROLS
-    # Prevent competing actions while automation is running.
-    # ==================================================================
     def set_controls(self, enabled):
         state = (
             "normal" if enabled else "disabled"
@@ -380,10 +405,6 @@ class AutomationMixin:
             button.config(state=state)
 
 
-    # ==================================================================
-    # AUTOMATION COMPLETION
-    # Reset running state, restore buttons, update status and report errors.
-    # ==================================================================
     def finish_automation(
         self, message, success=True
     ):
@@ -403,12 +424,7 @@ class AutomationMixin:
             )
 
 
-    # ==================================================================
-    # CANCEL AUTOMATION
-    # Invalidate scheduled callbacks, signal the worker and cancel pending Tkinter jobs.
-    # ==================================================================
     def cancel_automation(self):
-        # Increment the token so callbacks from older runs cannot continue.
         self.automation_token += 1
         self.external_cancel.set()
 
